@@ -67,18 +67,20 @@
   .mic-btn:active{transform:scale(.98);}
 
   /* Kalimba tine visual */
-  .kalimba{background:linear-gradient(180deg,#2b2018,#1b140e);border-radius:18px;padding:20px 10px 14px;position:relative;overflow:hidden;}
+  .kalimba{background:linear-gradient(180deg,#2b2018,#1b140e);border-radius:18px;padding:20px 0 8px;position:relative;}
   .kalimba::before{content:"";position:absolute;left:10%;right:10%;bottom:8px;height:40%;
     background:radial-gradient(ellipse at center, rgba(201,138,75,.18), transparent 70%);pointer-events:none;}
-  .tines{display:flex;align-items:flex-end;justify-content:center;gap:3px;position:relative;z-index:1;}
-  .tine{flex:1;max-width:26px;background:linear-gradient(180deg,var(--tine),#b7ad9a);border-radius:5px 5px 3px 3px;
+  .tines-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;scroll-snap-type:x proximity;
+    padding:0 14px 10px;position:relative;z-index:1;}
+  .tines{display:flex;align-items:flex-end;gap:4px;width:max-content;margin:0 auto;}
+  .tine{flex:0 0 auto;width:34px;background:linear-gradient(180deg,var(--tine),#b7ad9a);border-radius:5px 5px 3px 3px;
     display:flex;flex-direction:column;align-items:center;justify-content:flex-start;padding-top:6px;
-    font-size:9.5px;color:#2a2418;font-weight:700;cursor:pointer;border:none;position:relative;
-    box-shadow:0 3px 6px rgba(0,0,0,.4);}
-  .tine .num{opacity:.55;font-size:8px;margin-bottom:2px;}
+    font-size:11px;color:#2a2418;font-weight:700;cursor:pointer;border:none;position:relative;
+    scroll-snap-align:center;box-shadow:0 3px 6px rgba(0,0,0,.4);}
+  .tine .num{opacity:.55;font-size:9px;margin-bottom:2px;}
   .tine.active{background:linear-gradient(180deg,var(--tine-active),#b9793a);color:#241a0f;box-shadow:0 0 0 2px var(--wood-2),0 3px 8px rgba(0,0,0,.5);}
   .tine.detected{outline:2px solid var(--ok);}
-  .tine-base{height:14px;margin-top:auto;background:#100c08;border-radius:0 0 10px 10px;}
+  .scroll-hint{text-align:center;font-size:11.5px;color:var(--sub);padding-top:2px;position:relative;z-index:1;}
 
   .auto-toggle{display:flex;gap:8px;margin-top:14px;}
   .auto-toggle button{flex:1;padding:9px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
@@ -139,7 +141,10 @@
   </div>
 
   <div class="card kalimba">
-    <div class="tines" id="tines"></div>
+    <div class="tines-scroll" id="tinesScroll">
+      <div class="tines" id="tines"></div>
+    </div>
+    <div class="scroll-hint">← 좌우로 밀어서 다른 키 보기 →</div>
     <div class="auto-toggle">
       <button id="autoBtn" class="active">자동 감지</button>
       <button id="manualBtn">키 선택 고정</button>
@@ -181,7 +186,12 @@
     mode: "auto", // "auto" | "manual"
     selectedKey: 8, // center key index
     listening: false,
-    freqHistory: []
+    freqHistory: [],
+    lastGoodFreq: null,
+    lastGoodTime: 0,
+    noteCandidate: null,
+    noteCandidateCount: 0,
+    lockedNote: null
   };
 
   function noteToMidi(name){
@@ -235,6 +245,10 @@
           updateTargetLabel();
         });
         tinesEl.appendChild(btn);
+        if(i===centerIdx && !renderTines._centered){
+          renderTines._centered = true;
+          requestAnimationFrame(function(){ btn.scrollIntoView({inline:"center", block:"nearest"}); });
+        }
       })(i);
     }
   }
@@ -310,39 +324,47 @@
   var audioCtx=null, analyser=null, mediaStream=null, rafId=null;
   var buf=null;
 
+  // Returns {freq, confidence} for a clear periodic pitch, or null (too quiet / not tonal).
+  // confidence is a normalized autocorrelation coefficient (~1 = very pure tone, ~0 = noise).
   function autoCorrelate(buf, sampleRate){
     var SIZE = buf.length;
     var rms = 0;
     for(var i=0;i<SIZE;i++){ rms += buf[i]*buf[i]; }
     rms = Math.sqrt(rms/SIZE);
-    if(rms < 0.012) return -1; // too quiet
+    if(rms < 0.012) return null; // too quiet
 
-    var minFreq = 65, maxFreq = 1600;
+    // Kalimba keys (incl. custom C3-C7 range) sit well within 100-2200 Hz.
+    var minFreq = 100, maxFreq = 2200;
     var minLag = Math.floor(sampleRate/maxFreq);
     var maxLag = Math.min(Math.ceil(sampleRate/minFreq), SIZE-2);
 
-    var bestLag=-1, bestVal=-Infinity;
+    var bestLag=-1, bestNorm=-1;
     var c = new Float32Array(maxLag+2);
     for(var lag=minLag; lag<=maxLag; lag++){
-      var sum=0;
+      var sum=0, eA=0, eB=0;
       var n = SIZE-lag;
-      for(var j=0;j<n;j++){ sum += buf[j]*buf[j+lag]; }
+      for(var j=0;j<n;j++){
+        var a=buf[j], b=buf[j+lag];
+        sum += a*b; eA += a*a; eB += b*b;
+      }
       c[lag] = sum;
-      if(sum>bestVal){ bestVal=sum; bestLag=lag; }
+      var denom = Math.sqrt(eA*eB);
+      var norm = denom>0 ? sum/denom : 0;
+      if(norm>bestNorm){ bestNorm=norm; bestLag=lag; }
     }
-    if(bestLag<=minLag || bestLag>=maxLag) return -1;
+    if(bestLag<=minLag || bestLag>=maxLag) return null;
 
     var x1=c[bestLag-1], x2=c[bestLag], x3=c[bestLag+1];
-    var a=(x1+x3-2*x2)/2, b=(x3-x1)/2;
+    var a2=(x1+x3-2*x2)/2, b2=(x3-x1)/2;
     var refinedLag = bestLag;
-    if(a!==0) refinedLag = bestLag - b/(2*a);
-    if(refinedLag<=0) return -1;
-    return sampleRate/refinedLag;
+    if(a2!==0) refinedLag = bestLag - b2/(2*a2);
+    if(refinedLag<=0) return null;
+    return { freq: sampleRate/refinedLag, confidence: bestNorm };
   }
 
   function medianSmooth(freq){
     state.freqHistory.push(freq);
-    if(state.freqHistory.length>5) state.freqHistory.shift();
+    if(state.freqHistory.length>7) state.freqHistory.shift();
     var sorted = state.freqHistory.slice().sort(function(a,b){return a-b;});
     return sorted[Math.floor(sorted.length/2)];
   }
@@ -351,37 +373,40 @@
       needle=document.getElementById("needle"), centsText=document.getElementById("centsText"),
       hintText=document.getElementById("hintText");
 
-  function resetDisplay(){
+  var CONFIDENCE_MIN = 0.9;   // reject noise / inharmonic buzz
+  var HOLD_MS = 2200;         // keep showing the last good reading while a note rings out
+
+  function clearDetectionState(){
+    state.lastGoodFreq = null;
+    state.lastGoodTime = 0;
+    state.noteCandidate = null;
+    state.noteCandidateCount = 0;
+    state.lockedNote = null;
+    state.freqHistory = [];
+  }
+
+  function renderWaiting(msg){
     noteName.textContent="--"; noteName.style.color="var(--text)";
-    noteSub.textContent="마이크를 켜고 음을 튕겨보세요";
+    noteSub.textContent = msg;
     centsText.innerHTML="&nbsp;";
     hintText.textContent="대기 중"; hintText.className="hint idle";
     needle.style.left="50%"; needle.style.background="var(--wood-2)";
     document.querySelectorAll(".tine").forEach(function(t){t.classList.remove("detected");});
   }
 
-  function processAudio(){
-    analyser.getFloatTimeDomainData(buf);
-    var freq = autoCorrelate(buf, audioCtx.sampleRate);
+  function resetDisplay(){
+    clearDetectionState();
+    renderWaiting("마이크를 켜고 음을 튕겨보세요");
+  }
 
-    if(freq === -1){
-      needle.style.left="50%";
-      hintText.textContent="소리를 기다리는 중...";
-      hintText.className="hint idle";
-      rafId = requestAnimationFrame(processAudio);
-      return;
-    }
-
-    freq = medianSmooth(freq);
-
+  function renderResult(freq, holding){
     var targetMidi, targetFreq, detectedLabel;
     if(state.mode==="manual"){
       targetFreq = noteToFreq(state.notes[state.selectedKey]);
       targetMidi = noteToMidi(state.notes[state.selectedKey]);
       detectedLabel = state.notes[state.selectedKey];
     } else {
-      var midiFloat = freqToMidiFloat(freq);
-      targetMidi = Math.round(midiFloat);
+      targetMidi = state.lockedNote;
       targetFreq = midiToFreq(targetMidi);
       detectedLabel = midiToNoteName(targetMidi);
       // highlight matching physical key if it matches one of the 17 notes
@@ -417,9 +442,45 @@
     }
     needle.style.background = color;
     centsText.innerHTML = (cents>=0?"+":"")+"<b>"+cents.toFixed(0)+"</b> cents";
-    hintText.textContent = hintMsg;
+    hintText.textContent = hintMsg + (holding ? " · 여운 유지 중" : "");
     hintText.className = "hint "+hintClass;
+  }
 
+  function processAudio(){
+    analyser.getFloatTimeDomainData(buf);
+    var result = autoCorrelate(buf, audioCtx.sampleRate);
+    var now = performance.now();
+
+    if(!result || result.confidence < CONFIDENCE_MIN){
+      if(state.lastGoodFreq !== null && (now - state.lastGoodTime) < HOLD_MS){
+        renderResult(state.lastGoodFreq, true); // keep last reading visible while note rings out
+      } else {
+        clearDetectionState();
+        renderWaiting("소리를 기다리는 중...");
+      }
+      rafId = requestAnimationFrame(processAudio);
+      return;
+    }
+
+    var freq = medianSmooth(result.freq);
+    state.lastGoodFreq = freq;
+    state.lastGoodTime = now;
+
+    if(state.mode==="auto"){
+      var candidate = Math.round(freqToMidiFloat(freq));
+      if(candidate === state.noteCandidate){
+        state.noteCandidateCount++;
+      } else {
+        state.noteCandidate = candidate;
+        state.noteCandidateCount = 1;
+      }
+      // require 2 consistent frames before switching the displayed note, to avoid flicker
+      if(state.lockedNote===null || state.noteCandidateCount>=2){
+        state.lockedNote = candidate;
+      }
+    }
+
+    renderResult(freq, false);
     rafId = requestAnimationFrame(processAudio);
   }
 
@@ -448,7 +509,8 @@
       state.listening = true;
       micBtn.textContent = "⏹ 마이크 끄기";
       micBtn.classList.add("listening");
-      state.freqHistory = [];
+      clearDetectionState();
+      renderWaiting("소리를 기다리는 중...");
       processAudio();
     }).catch(function(err){
       alert("마이크 권한을 허용해주세요.\n("+err.message+")");
