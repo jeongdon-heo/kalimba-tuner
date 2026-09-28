@@ -191,7 +191,10 @@
     lastGoodTime: 0,
     noteCandidate: null,
     noteCandidateCount: 0,
-    lockedNote: null
+    lockedNote: null,
+    prevRms: 0,
+    onsetTime: -1e9,
+    freshOnset: false
   };
 
   function noteToMidi(name){
@@ -324,42 +327,50 @@
   var audioCtx=null, analyser=null, mediaStream=null, rafId=null;
   var buf=null;
 
-  // Returns {freq, confidence} for a clear periodic pitch, or null (too quiet / not tonal).
-  // confidence is a normalized autocorrelation coefficient (~1 = very pure tone, ~0 = noise).
-  function autoCorrelate(buf, sampleRate){
-    var SIZE = buf.length;
-    var rms = 0;
-    for(var i=0;i<SIZE;i++){ rms += buf[i]*buf[i]; }
-    rms = Math.sqrt(rms/SIZE);
-    if(rms < 0.012) return null; // too quiet
+  function getRms(buf){
+    var s = 0;
+    for(var i=0;i<buf.length;i++){ s += buf[i]*buf[i]; }
+    return Math.sqrt(s/buf.length);
+  }
 
-    // Kalimba keys (incl. custom C3-C7 range) sit well within 100-2200 Hz.
-    var minFreq = 100, maxFreq = 2200;
-    var minLag = Math.floor(sampleRate/maxFreq);
+  // Returns {freq, confidence} for a clear periodic pitch in [minFreq, maxFreq], or null (not tonal).
+  // confidence is a normalized autocorrelation coefficient (~1 = very pure tone, ~0 = noise).
+  function autoCorrelate(buf, sampleRate, minFreq, maxFreq){
+    var SIZE = buf.length;
+    var minLag = Math.max(2, Math.floor(sampleRate/maxFreq));
     var maxLag = Math.min(Math.ceil(sampleRate/minFreq), SIZE-2);
 
-    var bestLag=-1, bestNorm=-1;
-    var c = new Float32Array(maxLag+2);
-    for(var lag=minLag; lag<=maxLag; lag++){
+    // normalized correlation per lag (one extra lag on each side for the peak test)
+    var norm = new Float32Array(maxLag+2);
+    var bestNorm = -1;
+    for(var lag=minLag-1; lag<=maxLag+1; lag++){
       var sum=0, eA=0, eB=0;
       var n = SIZE-lag;
       for(var j=0;j<n;j++){
         var a=buf[j], b=buf[j+lag];
         sum += a*b; eA += a*a; eB += b*b;
       }
-      c[lag] = sum;
       var denom = Math.sqrt(eA*eB);
-      var norm = denom>0 ? sum/denom : 0;
-      if(norm>bestNorm){ bestNorm=norm; bestLag=lag; }
+      norm[lag] = denom>0 ? sum/denom : 0;
+      if(lag>=minLag && lag<=maxLag && norm[lag]>bestNorm) bestNorm = norm[lag];
     }
-    if(bestLag<=minLag || bestLag>=maxLag) return null;
 
-    var x1=c[bestLag-1], x2=c[bestLag], x3=c[bestLag+1];
+    // A tone repeats at 1x, 2x, 3x... its period, and those later peaks can score
+    // almost as high as the true one. Taking the overall maximum therefore often
+    // reads an octave (or more) too low. Instead take the FIRST peak that is
+    // nearly as strong as the best one = the true (shortest) period.
+    var pick = -1;
+    for(var l=minLag; l<=maxLag; l++){
+      if(norm[l]>=norm[l-1] && norm[l]>norm[l+1] && norm[l]>=bestNorm*0.9){ pick = l; break; }
+    }
+    if(pick<0) return null;
+
+    var x1=norm[pick-1], x2=norm[pick], x3=norm[pick+1];
     var a2=(x1+x3-2*x2)/2, b2=(x3-x1)/2;
-    var refinedLag = bestLag;
-    if(a2!==0) refinedLag = bestLag - b2/(2*a2);
+    var refinedLag = pick;
+    if(a2!==0) refinedLag = pick - b2/(2*a2);
     if(refinedLag<=0) return null;
-    return { freq: sampleRate/refinedLag, confidence: bestNorm };
+    return { freq: sampleRate/refinedLag, confidence: norm[pick] };
   }
 
   function medianSmooth(freq){
@@ -375,6 +386,9 @@
 
   var CONFIDENCE_MIN = 0.9;   // reject noise / inharmonic buzz
   var HOLD_MS = 2200;         // keep showing the last good reading while a note rings out
+  var RMS_MIN = 0.012;        // below this = too quiet
+  var ONSET_RATIO = 1.8;      // loudness jump that counts as a new pluck
+  var ATTACK_SKIP_MS = 90;    // ignore the pluck "click" at the start of each note
 
   function clearDetectionState(){
     state.lastGoodFreq = null;
@@ -448,8 +462,25 @@
 
   function processAudio(){
     analyser.getFloatTimeDomainData(buf);
-    var result = autoCorrelate(buf, audioCtx.sampleRate);
     var now = performance.now();
+    var rms = getRms(buf);
+
+    // New pluck (sudden jump in loudness): forget the previous note's readings, and
+    // ignore the first moment of the pluck, where the "click" and strong overtones
+    // make the pitch unreliable (esp. when plucked hard).
+    if(rms >= RMS_MIN && rms > state.prevRms*ONSET_RATIO){
+      state.onsetTime = now;
+      state.freqHistory = [];
+      state.noteCandidate = null;
+      state.noteCandidateCount = 0;
+      state.freshOnset = true;
+    }
+    state.prevRms = rms;
+
+    var result = null;
+    if(rms >= RMS_MIN && now - state.onsetTime >= ATTACK_SKIP_MS){
+      result = autoCorrelate(buf, audioCtx.sampleRate, 100, 2200); // covers custom C3-C7 range
+    }
 
     if(!result || result.confidence < CONFIDENCE_MIN){
       if(state.lastGoodFreq !== null && (now - state.lastGoodTime) < HOLD_MS){
@@ -463,8 +494,6 @@
     }
 
     var freq = medianSmooth(result.freq);
-    state.lastGoodFreq = freq;
-    state.lastGoodTime = now;
 
     if(state.mode==="auto"){
       var candidate = Math.round(freqToMidiFloat(freq));
@@ -475,11 +504,21 @@
         state.noteCandidateCount = 1;
       }
       // require 2 consistent frames before switching the displayed note, to avoid flicker
-      if(state.lockedNote===null || state.noteCandidateCount>=2){
+      // (except right after a new pluck, where the old note is no longer relevant)
+      if(state.lockedNote===null || state.freshOnset || state.noteCandidateCount>=2){
         state.lockedNote = candidate;
+      }
+      state.freshOnset = false;
+      // Still switching to a different note: don't compare this sound against the
+      // old note (that would slam the needle to one end); keep the current display.
+      if(candidate !== state.lockedNote){
+        rafId = requestAnimationFrame(processAudio);
+        return;
       }
     }
 
+    state.lastGoodFreq = freq;
+    state.lastGoodTime = now;
     renderResult(freq, false);
     rafId = requestAnimationFrame(processAudio);
   }
