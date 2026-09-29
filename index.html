@@ -236,8 +236,11 @@
     onsetTime: -1e9,
     freshOnset: false,
     env: "quiet", // "quiet" | "class" — class mode ignores quieter (farther-away) sounds
-    classLevel: 2, // index into CLASS_RMS_MIN
+    classLevel: 2, // index into CLASS_RMS_MAX / CLASS_FACTOR
     levelShown: 0,
+    onsetPeak: 0,     // loudest level since the latest pluck began
+    noteActive: false, // classroom mode: latest pluck was loud enough, still ringing
+    recentPeak: 0, recentPeakTime: 0, // for the diagnostics readout
     noiseFloor: null, // slowly-tracked background loudness of this room + this device's mic
     showDiag: false
   };
@@ -248,13 +251,19 @@
   // devices behave as before, and never below a tiny floor.
   var QUIET_RMS_MAX = 0.012, QUIET_FACTOR = 3;
   var CLASS_RMS_MAX = [0.02, 0.03, 0.045, 0.065, 0.09]; // "약하게" → "강하게"
-  var CLASS_FACTOR  = [5, 8, 12, 18, 26];
+  // Classroom mode judges a sound by its PLUCK: the loudest moment right after it starts
+  // must pass the gate. A pluck that passes is then followed while it rings out and
+  // gets quieter (a kalimba note fades fast, especially on a quiet laptop mic).
+  var ACCEPT_MS = 200;          // how long after a pluck starts we look for its peak
+  var SUSTAIN_OF_PEAK = 0.05;   // keep following the note until it falls to 5% of its peak
+  var CLASS_FACTOR  = [4, 6, 8, 11, 15];
   var RMS_ABS_MIN = 0.0015;
-  function rmsMin(){
-    var cap = state.env==="class" ? CLASS_RMS_MAX[state.classLevel] : QUIET_RMS_MAX;
+  function rmsMin(env){
+    env = env || state.env;
+    var cap = env==="class" ? CLASS_RMS_MAX[state.classLevel] : QUIET_RMS_MAX;
     if(state.noiseFloor===null) return cap;
-    var factor = state.env==="class" ? CLASS_FACTOR[state.classLevel] : QUIET_FACTOR;
-    return Math.min(cap, Math.max(state.env==="class" ? RMS_ABS_MIN*2 : RMS_ABS_MIN, state.noiseFloor*factor));
+    var factor = env==="class" ? CLASS_FACTOR[state.classLevel] : QUIET_FACTOR;
+    return Math.min(cap, Math.max(env==="class" ? RMS_ABS_MIN*2 : RMS_ABS_MIN, state.noiseFloor*factor));
   }
   // Background = a quiet-ish moment of the last ~5 s (10th percentile of loudness),
   // so a note ringing for a couple of seconds doesn't count as "background".
@@ -595,11 +604,11 @@
 
   var levelFill = document.getElementById("levelFill");
   var levelLine = document.getElementById("levelLine");
-  function updateLevel(rms, threshold){
+  function updateLevel(rms, threshold, loudEnough){
     // rise instantly, fall slowly, so a pluck is easy to see
     state.levelShown = Math.max(rms, state.levelShown*0.92);
     levelFill.style.width = levelPct(state.levelShown)+"%";
-    levelFill.classList.toggle("loud", rms >= threshold);
+    levelFill.classList.toggle("loud", loudEnough);
     levelLine.style.left = levelPct(threshold)+"%";
   }
 
@@ -610,6 +619,7 @@
     if(now - diagTime < 200) return; // 5x per second is plenty to read
     diagTime = now;
     diagEl.innerHTML = "소리 "+rms.toFixed(4)+" / 기준 "+gate.toFixed(4)+" / 배경 "+(state.noiseFloor||0).toFixed(4)+"<br>"+
+      "최근 가장 큰 소리 "+state.recentPeak.toFixed(4)+(state.env==="class" ? (state.noteActive ? " · 내 소리로 인정 ✓" : " · 인정 안 됨") : "")+"<br>"+
       (result ? "또렷함 "+result.confidence.toFixed(2)+" / "+result.freq.toFixed(1)+" Hz" : "또렷함 - / - Hz")+
       "<br>"+trackInfo;
   }
@@ -619,28 +629,43 @@
     var now = performance.now();
     var rms = getRms(buf);
     updateNoiseFloor(rms);
-    var RMS_MIN = rmsMin();
-    updateLevel(rms, RMS_MIN);
+    var quietGate = rmsMin("quiet");
+    var gate = rmsMin();
 
     // New pluck (sudden jump in loudness): forget the previous note's readings, and
     // ignore the first moment of the pluck, where the "click" and strong overtones
     // make the pitch unreliable (esp. when plucked hard).
-    if(rms >= RMS_MIN && rms > state.prevRms*ONSET_RATIO){
+    if(rms >= quietGate && rms > state.prevRms*ONSET_RATIO){
       state.onsetTime = now;
+      state.onsetPeak = rms;
+      state.noteActive = false;
       state.freqHistory = [];
       state.noteCandidate = null;
       state.noteCandidateCount = 0;
       state.freshOnset = true;
+    } else if(now - state.onsetTime < ACCEPT_MS){
+      state.onsetPeak = Math.max(state.onsetPeak, rms);
     }
     state.prevRms = rms;
+    if(rms > state.recentPeak || now - state.recentPeakTime > 2500){ state.recentPeak = rms; state.recentPeakTime = now; }
 
+    var loudEnough;
+    if(state.env==="class"){
+      if(!state.noteActive && now - state.onsetTime < ACCEPT_MS && state.onsetPeak >= gate) state.noteActive = true;
+      if(state.noteActive && rms < Math.max(quietGate, state.onsetPeak*SUSTAIN_OF_PEAK)) state.noteActive = false;
+      loudEnough = state.noteActive;
+    } else {
+      loudEnough = rms >= gate;
+    }
+    updateLevel(rms, gate, loudEnough);
+
+    var heard = loudEnough && now - state.onsetTime >= ATTACK_SKIP_MS;
     var result = null;
-    if(rms >= RMS_MIN && now - state.onsetTime >= ATTACK_SKIP_MS){
+    if(heard){
       result = autoCorrelate(buf, audioCtx.sampleRate, 100, 2200); // covers custom C3-C7 range
     }
-    var heard = rms >= RMS_MIN && now - state.onsetTime >= ATTACK_SKIP_MS;
     var unclear = heard && (!result || result.confidence < CONFIDENCE_MIN);
-    updateDiag(rms, RMS_MIN, result);
+    updateDiag(rms, gate, result);
     // Key fixed: a sound far from the chosen note is someone else's tine (or another of
     // ours still ringing) — treat it like silence so it can't move the needle.
     if(result && state.mode==="manual"){
@@ -746,6 +771,8 @@
     levelFill.style.width = "0";
     levelFill.classList.remove("loud");
     state.noiseFloor = null;
+    state.noteActive = false;
+    state.recentPeak = 0;
     updateEnvUI();
     resetDisplay();
   }
