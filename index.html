@@ -153,7 +153,7 @@
 
     <div class="diag" id="diag" hidden></div>
 
-    <div class="level">
+    <div class="level" id="levelBox">
       <div class="level-head"><span>🔊 소리 크기</span><span>막대가 <b style="color:var(--wood-2)">주황 선</b>을 넘어야 인식돼요</span></div>
       <div class="level-track">
         <div class="level-fill" id="levelFill"></div>
@@ -380,6 +380,8 @@
   function updateEnvUI(){
     document.getElementById("quietBtn").classList.toggle("active", state.env==="quiet");
     document.getElementById("classBtn").classList.toggle("active", state.env==="class");
+    // the loudness bar only matters in classroom mode; in a quiet place it just confuses
+    document.getElementById("levelBox").hidden = state.env!=="class";
     document.getElementById("levelLine").style.left = levelPct(rmsMin())+"%";
     var tip = document.getElementById("envTip");
     if(state.env==="quiet"){
