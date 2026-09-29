@@ -61,6 +61,18 @@
   .hint.ok{color:var(--ok);}
   .hint.idle{color:var(--sub);font-weight:400;}
 
+  /* Input level bar */
+  .level{margin:12px 2px 4px;}
+  .level-head{display:flex;justify-content:space-between;font-size:11px;color:var(--sub);margin-bottom:5px;}
+  .level-track{position:relative;height:10px;border-radius:6px;background:rgba(255,255,255,.07);overflow:hidden;}
+  .level-fill{position:absolute;left:0;top:0;bottom:0;width:0;background:#6b5f52;border-radius:6px;}
+  .level-fill.loud{background:var(--ok);}
+  .level-line{position:absolute;top:-2px;bottom:-2px;width:2px;background:var(--wood-2);transform:translateX(-1px);}
+
+  .env-toggle{margin:10px 0 0;}
+  .env-tip{font-size:12px;color:var(--sub);text-align:center;margin:8px 0 12px;line-height:1.5;min-height:18px;}
+  .env-tip b{color:var(--wood-2);}
+
   .mic-btn{display:block;width:100%;margin-top:4px;padding:14px;border:none;border-radius:14px;
     font-size:16px;font-weight:700;background:var(--wood);color:#241a0f;cursor:pointer;}
   .mic-btn.listening{background:#3a332b;color:var(--wood-2);border:1px solid var(--wood);}
@@ -137,6 +149,20 @@
     <div class="cents-text" id="centsText">&nbsp;</div>
     <div class="hint idle" id="hintText">대기 중</div>
 
+    <div class="level">
+      <div class="level-head"><span>🔊 소리 크기</span><span>막대가 <b style="color:var(--wood-2)">주황 선</b>을 넘어야 인식돼요</span></div>
+      <div class="level-track">
+        <div class="level-fill" id="levelFill"></div>
+        <div class="level-line" id="levelLine"></div>
+      </div>
+    </div>
+
+    <div class="auto-toggle env-toggle">
+      <button id="quietBtn">🤫 조용한 곳</button>
+      <button id="classBtn">🏫 교실 모드</button>
+    </div>
+    <div class="env-tip" id="envTip"></div>
+
     <button class="mic-btn" id="micBtn">🎤 마이크 켜기</button>
   </div>
 
@@ -157,6 +183,12 @@
       <label>기준음 A4 (Hz)</label>
       <input type="number" id="a4Input" value="440" min="415" max="466" step="1">
     </div>
+    <div class="setting-row">
+      <label>교실 모드 소리 기준<br><span style="font-size:11px;color:var(--sub);">잘 인식되지 않으면 왼쪽(약하게)으로</span></label>
+      <span style="display:flex;align-items:center;gap:6px;font-size:11px;color:var(--sub);">
+        약하게<input type="range" id="classLevel" min="0" max="4" step="1" value="2">강하게
+      </span>
+    </div>
     <label style="font-size:12.5px;color:var(--sub);">튜닝 프리셋</label>
     <select class="preset-select" id="presetSelect">
       <option value="c-major">C 메이저 (표준 17키)</option>
@@ -168,7 +200,7 @@
 
   <footer>
     ⚠ 마이크 사용은 HTTPS(또는 localhost) 환경에서만 동작합니다.<br>
-    조용한 곳에서 한 키씩 또렷하게 튕겨주세요.
+    칼림바를 마이크 가까이 대고 한 키씩 또렷하게 튕겨주세요.
   </footer>
 </div>
 
@@ -194,8 +226,35 @@
     lockedNote: null,
     prevRms: 0,
     onsetTime: -1e9,
-    freshOnset: false
+    freshOnset: false,
+    env: "quiet", // "quiet" | "class" — class mode ignores quieter (farther-away) sounds
+    classLevel: 2, // index into CLASS_RMS_MIN
+    levelShown: 0
   };
+
+  // Minimum loudness (RMS) for a sound to be analysed at all.
+  var QUIET_RMS_MIN = 0.012;
+  var CLASS_RMS_MIN = [0.02, 0.03, 0.045, 0.065, 0.09]; // "약하게" → "강하게"
+  function rmsMin(){
+    return state.env==="class" ? CLASS_RMS_MIN[state.classLevel] : QUIET_RMS_MIN;
+  }
+
+  // Remember the classroom settings on this device (browser storage may be unavailable).
+  function loadPrefs(){
+    try{
+      var env = localStorage.getItem("kalimbaTuner.env");
+      if(env==="quiet" || env==="class") state.env = env;
+      var lv = parseInt(localStorage.getItem("kalimbaTuner.classLevel"),10);
+      if(lv>=0 && lv<CLASS_RMS_MIN.length) state.classLevel = lv;
+    }catch(e){}
+  }
+  function savePrefs(){
+    try{
+      localStorage.setItem("kalimbaTuner.env", state.env);
+      localStorage.setItem("kalimbaTuner.classLevel", String(state.classLevel));
+    }catch(e){}
+  }
+  loadPrefs();
 
   function noteToMidi(name){
     var m = name.match(/^([A-G]#?)(\d)$/);
@@ -271,7 +330,40 @@
   function updateModeButtons(){
     document.getElementById("autoBtn").classList.toggle("active", state.mode==="auto");
     document.getElementById("manualBtn").classList.toggle("active", state.mode==="manual");
+    updateEnvUI();
   }
+
+  // ---------- Quiet place / classroom mode ----------
+  function levelPct(rms){
+    // show loudness on a -60 dB .. 0 dB scale so quiet and loud sounds both fit
+    var db = 20*Math.log10(Math.max(rms, 1e-6));
+    return Math.max(0, Math.min(100, (db+60)/60*100));
+  }
+  function updateEnvUI(){
+    document.getElementById("quietBtn").classList.toggle("active", state.env==="quiet");
+    document.getElementById("classBtn").classList.toggle("active", state.env==="class");
+    document.getElementById("levelLine").style.left = levelPct(rmsMin())+"%";
+    var tip = document.getElementById("envTip");
+    if(state.env==="quiet"){
+      tip.innerHTML = "작은 소리도 잘 들어요. 여럿이 함께 쓸 땐 <b>교실 모드</b>를 켜세요.";
+    } else if(state.mode==="auto"){
+      tip.innerHTML = "칼림바를 마이크에 <b>한 뼘 안으로</b> 대고 튕기세요.<br>아래에서 <b>키를 눌러 고정</b>하면 옆 친구 소리를 더 잘 걸러내요.";
+    } else {
+      tip.innerHTML = "칼림바를 마이크에 <b>한 뼘 안으로</b> 대고 튕기세요.<br>고정한 키와 다른 음(옆 친구 소리)은 무시해요.";
+    }
+  }
+  document.getElementById("quietBtn").addEventListener("click", function(){
+    state.env="quiet"; savePrefs(); updateEnvUI();
+  });
+  document.getElementById("classBtn").addEventListener("click", function(){
+    state.env="class"; savePrefs(); updateEnvUI();
+  });
+  var classLevelEl = document.getElementById("classLevel");
+  classLevelEl.value = state.classLevel;
+  classLevelEl.addEventListener("input", function(e){
+    state.classLevel = parseInt(e.target.value,10);
+    savePrefs(); updateEnvUI();
+  });
   document.getElementById("autoBtn").addEventListener("click", function(){
     state.mode="auto"; updateModeButtons(); renderTines(); updateTargetLabel();
   });
@@ -322,6 +414,7 @@
   renderTines();
   renderKeyTable();
   updateTargetLabel();
+  updateEnvUI();
 
   // ---------- Audio / pitch detection ----------
   var audioCtx=null, analyser=null, mediaStream=null, rafId=null;
@@ -386,7 +479,7 @@
 
   var CONFIDENCE_MIN = 0.9;   // reject noise / inharmonic buzz
   var HOLD_MS = 2200;         // keep showing the last good reading while a note rings out
-  var RMS_MIN = 0.012;        // below this = too quiet
+  var MANUAL_WINDOW_CENTS = 120; // key-fixed mode: ignore sounds farther than this from the target (e.g. a neighbour's other note)
   var ONSET_RATIO = 1.8;      // loudness jump that counts as a new pluck
   var ATTACK_SKIP_MS = 90;    // ignore the pluck "click" at the start of each note
 
@@ -460,10 +553,27 @@
     hintText.className = "hint "+hintClass;
   }
 
+  function waitingMsg(){
+    if(state.mode==="manual"){
+      return "키 "+(state.selectedKey+1)+" ("+state.notes[state.selectedKey]+") 소리를 기다리는 중...";
+    }
+    return "소리를 기다리는 중...";
+  }
+
+  var levelFill = document.getElementById("levelFill");
+  function updateLevel(rms, threshold){
+    // rise instantly, fall slowly, so a pluck is easy to see
+    state.levelShown = Math.max(rms, state.levelShown*0.92);
+    levelFill.style.width = levelPct(state.levelShown)+"%";
+    levelFill.classList.toggle("loud", rms >= threshold);
+  }
+
   function processAudio(){
     analyser.getFloatTimeDomainData(buf);
     var now = performance.now();
     var rms = getRms(buf);
+    var RMS_MIN = rmsMin();
+    updateLevel(rms, RMS_MIN);
 
     // New pluck (sudden jump in loudness): forget the previous note's readings, and
     // ignore the first moment of the pluck, where the "click" and strong overtones
@@ -481,13 +591,19 @@
     if(rms >= RMS_MIN && now - state.onsetTime >= ATTACK_SKIP_MS){
       result = autoCorrelate(buf, audioCtx.sampleRate, 100, 2200); // covers custom C3-C7 range
     }
+    // Key fixed: a sound far from the chosen note is someone else's tine (or another of
+    // ours still ringing) — treat it like silence so it can't move the needle.
+    if(result && state.mode==="manual"){
+      var offCents = 1200*Math.log2(result.freq/noteToFreq(state.notes[state.selectedKey]));
+      if(Math.abs(offCents) > MANUAL_WINDOW_CENTS) result = null;
+    }
 
     if(!result || result.confidence < CONFIDENCE_MIN){
       if(state.lastGoodFreq !== null && (now - state.lastGoodTime) < HOLD_MS){
         renderResult(state.lastGoodFreq, true); // keep last reading visible while note rings out
       } else {
         clearDetectionState();
-        renderWaiting("소리를 기다리는 중...");
+        renderWaiting(waitingMsg());
       }
       rafId = requestAnimationFrame(processAudio);
       return;
@@ -549,7 +665,7 @@
       micBtn.textContent = "⏹ 마이크 끄기";
       micBtn.classList.add("listening");
       clearDetectionState();
-      renderWaiting("소리를 기다리는 중...");
+      renderWaiting(waitingMsg());
       processAudio();
     }).catch(function(err){
       alert("마이크 권한을 허용해주세요.\n("+err.message+")");
@@ -564,6 +680,9 @@
     if(mediaStream) mediaStream.getTracks().forEach(function(t){t.stop();});
     if(audioCtx) audioCtx.close();
     audioCtx=null; analyser=null; mediaStream=null;
+    state.levelShown = 0;
+    levelFill.style.width = "0";
+    levelFill.classList.remove("loud");
     resetDisplay();
   }
 })();
